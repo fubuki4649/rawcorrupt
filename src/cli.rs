@@ -38,6 +38,10 @@ pub struct Cli {
     /// Disable exporting corrupted files to a log file
     #[arg(long = "no-log", default_value_t = false)]
     pub no_log: bool,
+
+    /// Show detailed LibRaw diagnostic return codes for each file
+    #[arg(short = 'd', long = "diagnostics", default_value_t = false)]
+    pub diagnostics: bool,
 }
 
 pub async fn run_cli() {
@@ -49,6 +53,7 @@ pub async fn run_cli() {
         cli.half_size,
         cli.save_thumbnails,
         log_file,
+        cli.diagnostics,
     )
     .await;
 

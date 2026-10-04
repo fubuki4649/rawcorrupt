@@ -1,5 +1,7 @@
 use crate::ingest::failure::{CorruptedFile, FailureCategory, FailureDetail};
-use crate::ingest::helpers::extract_thumbnail::test_extract_thumbnail;
+use crate::ingest::helpers::extract_thumbnail::{
+    detect_dcraw_emu_version, libraw_version_string, test_extract_thumbnail,
+};
 use crate::ingest::helpers::hash_and_transfer::hash_and_read;
 use crate::ingest::helpers::search_path::{is_image_by_infer, search_path_for_assets};
 use crate::ingest::traits::SuisaiAsset;
@@ -33,15 +35,59 @@ pub async fn ingest(
     half_size: bool,
     save_thumbnails: Option<PathBuf>,
     log_file: Option<PathBuf>,
+    diagnostics: bool,
 ) -> IngestSummary {
     let target = PathBuf::from(&path);
     let start_time = Instant::now();
+    let is_single_file = target.is_file();
+
+    let tool_version = libraw_version_string();
+    let dcraw_version = detect_dcraw_emu_version();
+
+    println!("{}", "=".repeat(60).cyan());
+    println!(
+        "{}",
+        "               LIBRAW ENVIRONMENT & DIAGNOSTICS               ".bold()
+    );
+    println!("{}", "=".repeat(60).cyan());
+    println!("  Tool LibRaw Version:     {}", tool_version.green().bold());
+    match dcraw_version {
+        Some(ref sys_ver) => {
+            if tool_version.starts_with(sys_ver) || sys_ver.starts_with(&tool_version) {
+                println!(
+                    "  System dcraw_emu:        {} {}",
+                    sys_ver.green().bold(),
+                    format!("(matches tool: {tool_version})").dimmed()
+                );
+            } else {
+                println!(
+                    "  System dcraw_emu:        {} {}",
+                    sys_ver.yellow().bold(),
+                    format!("(VERSION MISMATCH vs tool: {tool_version})")
+                        .red()
+                        .bold()
+                );
+            }
+        }
+        None => {
+            println!(
+                "  System dcraw_emu:        {}",
+                "not found in PATH".yellow()
+            );
+        }
+    }
+    println!(
+        "  Path Input Mode:         {}",
+        "libraw_open_file (direct file path, no buffer/stream)".cyan()
+    );
+    println!("{}", "=".repeat(60).cyan());
+    println!();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<(PathBuf, PathBuf)>(100);
     let shared_rx = Arc::new(Mutex::new(rx));
 
     // Handle single file input or directory traversal
-    if target.is_file() {
+    if is_single_file {
         let parent = target.parent().unwrap_or(Path::new(""));
         let rel = target.strip_prefix(parent).unwrap_or(&target).to_path_buf();
         tx.send((target.clone(), rel)).await.ok();
@@ -103,6 +149,7 @@ pub async fn ingest(
                 let mut computed_hash: Option<String> = None;
                 let mut file_bytes: u64 = 0;
                 let mut extracted_asset: Option<NewDbAsset> = None;
+                let mut libraw_diag = None;
 
                 // Step 1: Search & Type Check (run off-thread to avoid blocking Tokio reactor)
                 let path_for_infer = path.clone();
@@ -156,7 +203,14 @@ pub async fn ingest(
                     match meta_res {
                         Ok(asset) => {
                             extracted_asset = Some(asset);
-                            failure = thumb_res.and_then(|r| r.err());
+                            match thumb_res {
+                                Some(Ok(diag)) => libraw_diag = Some(diag),
+                                Some(Err(fail)) => {
+                                    libraw_diag = fail.diagnostics.clone();
+                                    failure = Some(fail);
+                                }
+                                None => {}
+                            }
                         }
                         Err(fail) => failure = Some(fail),
                     }
@@ -175,6 +229,7 @@ pub async fn ingest(
                             path: std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
                             category: fail.category,
                             error: fail.message.clone(),
+                            diagnostics: fail.diagnostics.clone(),
                         });
                     } else {
                         s.passed += 1;
@@ -192,6 +247,17 @@ pub async fn ingest(
                         "Error:         ".red().bold(),
                         fail.message
                     );
+                    if let Some(ref diag) = fail.diagnostics {
+                        eprintln!("  {} {}", "LibRaw Route:  ".cyan().bold(), diag.open_route);
+                        eprintln!(
+                            "  {} {}",
+                            "Return Codes:  ".cyan().bold(),
+                            diag.status_summary()
+                        );
+                        if let Some(ref cb) = diag.data_callback {
+                            eprintln!("  {} {}", "Data Callback: ".yellow().bold(), cb);
+                        }
+                    }
                     if let Some(h) = computed_hash {
                         eprintln!("  {} {h}", "xxh3 Hash:     ".cyan());
                     }
@@ -226,6 +292,12 @@ pub async fn ingest(
                         file_bytes as f64 / (1024.0 * 1024.0),
                         meta_info
                     );
+                    if (is_single_file || diagnostics)
+                        && let Some(ref diag) = libraw_diag
+                    {
+                        println!("  {} {}", "LibRaw Route:  ".cyan(), diag.open_route);
+                        println!("  {} {}", "Return Codes:  ".cyan(), diag.status_summary());
+                    }
                 }
             }
         });

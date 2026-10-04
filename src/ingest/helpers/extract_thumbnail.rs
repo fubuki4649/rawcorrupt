@@ -55,7 +55,82 @@ unsafe extern "C" fn raw_data_error_callback(data: *mut c_void, file: *const c_c
     }
 }
 
-use crate::ingest::failure::FailureDetail;
+use crate::ingest::failure::{FailureDetail, LibRawDiagnostics};
+
+pub fn libraw_version_string() -> String {
+    unsafe {
+        let p = rawlib::ffi::libraw_version();
+        if p.is_null() {
+            "unknown".to_string()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+pub fn detect_dcraw_emu_version() -> Option<String> {
+    // 1. Check if dcraw_emu is available on the system
+    let which_out = std::process::Command::new("which")
+        .arg("dcraw_emu")
+        .output()
+        .ok()?;
+    if !which_out.status.success() {
+        return None;
+    }
+    let dcraw_path = String::from_utf8_lossy(&which_out.stdout)
+        .trim()
+        .to_string();
+
+    // 2. Try ldd to find the linked libraw shared library path and extract its exact version
+    if let Ok(ldd_out) = std::process::Command::new("ldd").arg(&dcraw_path).output() {
+        let text = String::from_utf8_lossy(&ldd_out.stdout);
+        for line in text.lines() {
+            if line.contains("libraw")
+                && line.contains("=>")
+                && let Some(path_part) = line.split("=>").nth(1)
+            {
+                let so_path = path_part.split('(').next().unwrap_or("").trim();
+                if !so_path.is_empty()
+                    && let Ok(strings_out) =
+                        std::process::Command::new("strings").arg(so_path).output()
+                {
+                    let s_text = String::from_utf8_lossy(&strings_out.stdout);
+                    for s in s_text.lines() {
+                        if (s.starts_with("0.") || s.starts_with("1.")) && s.contains("Release") {
+                            return Some(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: pkg-config --modversion libraw
+    if let Ok(out) = std::process::Command::new("pkg-config")
+        .args(["--modversion", "libraw"])
+        .output()
+        && out.status.success()
+    {
+        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !ver.is_empty() {
+            return Some(ver);
+        }
+    }
+
+    // 4. Fallback: pacman / dpkg
+    if let Ok(out) = std::process::Command::new("pacman")
+        .args(["-Q", "libraw"])
+        .output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(v) = s.split_whitespace().nth(1) {
+            return Some(v.to_string());
+        }
+    }
+
+    Some("found (version unknown)".to_string())
+}
 
 fn libraw_err_str(code: c_int) -> std::borrow::Cow<'static, str> {
     unsafe {
@@ -68,9 +143,9 @@ fn libraw_err_str(code: c_int) -> std::borrow::Cow<'static, str> {
     }
 }
 
-fn map_libraw_open_error(ret: c_int) -> FailureDetail {
+fn map_libraw_open_error(ret: c_int, diag: LibRawDiagnostics) -> FailureDetail {
     let err_str = libraw_err_str(ret);
-    match ret {
+    let fail = match ret {
         LIBRAW_IO_ERROR => {
             FailureDetail::file_read(format!("LibRaw read I/O error {ret}: {err_str}"))
         }
@@ -78,14 +153,15 @@ fn map_libraw_open_error(ret: c_int) -> FailureDetail {
             FailureDetail::metadata(format!("Unsupported camera RAW format: {err_str}"))
         }
         _ => FailureDetail::raw_sensor_data(format!("LibRaw open_file error {ret}: {err_str}")),
-    }
+    };
+    fail.with_diagnostics(diag)
 }
 
 /// Decodes camera RAW data using LibRaw while catching internal sensor corruption callbacks.
 fn decode_raw_with_error_handler(
     input_path: &Path,
     opts: &DecodeOptions,
-) -> Result<ProcessedImage, FailureDetail> {
+) -> Result<(ProcessedImage, LibRawDiagnostics), FailureDetail> {
     if !input_path.exists() {
         return Err(FailureDetail::file_read(format!(
             "File does not exist: {}",
@@ -114,22 +190,28 @@ fn decode_raw_with_error_handler(
         .map_err(|e| FailureDetail::file_read(format!("Path contains null byte: {e}")))?;
     let ret = unsafe { rawlib::ffi::libraw_open_file(handle.0, c_path.as_ptr()) };
 
+    let mut diag = LibRawDiagnostics::new(ret);
+
     if ret != rawlib::ffi::LIBRAW_SUCCESS {
-        return Err(map_libraw_open_error(ret));
+        return Err(map_libraw_open_error(ret, diag));
     }
 
     if let Some(err) = data_error.take() {
+        diag.data_callback = Some(err.clone());
         return Err(FailureDetail::raw_sensor_data(format!(
             "LibRaw data corruption during open: {err}"
-        )));
+        ))
+        .with_diagnostics(diag));
     }
 
     // Verify embedded thumbnail if present in camera RAW file
     let thumb_ret = unsafe { rawlib::ffi::libraw_unpack_thumb(handle.0) };
     if let Some(err) = data_error.take() {
+        diag.data_callback = Some(err.clone());
         return Err(FailureDetail::embedded_thumbnail(format!(
             "Corrupted embedded thumbnail in RAW file: {err}"
-        )));
+        ))
+        .with_diagnostics(diag));
     }
     if thumb_ret != rawlib::ffi::LIBRAW_SUCCESS
         && thumb_ret != LIBRAW_NO_THUMBNAIL
@@ -139,7 +221,8 @@ fn decode_raw_with_error_handler(
         return Err(FailureDetail::embedded_thumbnail(format!(
             "Corrupted embedded thumbnail stream: {}",
             libraw_err_str(thumb_ret)
-        )));
+        ))
+        .with_diagnostics(diag));
     }
 
     unsafe {
@@ -155,51 +238,62 @@ fn decode_raw_with_error_handler(
         }
     }
 
-    let check_step =
-        |ret: c_int, err: &mut Option<String>, step: &str| -> Result<(), FailureDetail> {
-            if let Some(e) = err.take() {
-                Err(FailureDetail::raw_sensor_data(format!(
-                    "LibRaw sensor data corruption during {step}: {e}"
-                )))
-            } else if ret != rawlib::ffi::LIBRAW_SUCCESS {
-                Err(FailureDetail::raw_sensor_data(format!(
-                    "LibRaw {step} error {ret}: {}",
-                    libraw_err_str(ret)
-                )))
-            } else {
-                Ok(())
-            }
-        };
+    let unpack_ret = unsafe { rawlib::ffi::libraw_unpack(handle.0) };
+    diag.unpack_status = Some(unpack_ret);
+    if let Some(e) = data_error.take() {
+        diag.data_callback = Some(e.clone());
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw sensor data corruption during unpack: {e}"
+        ))
+        .with_diagnostics(diag));
+    }
+    if unpack_ret != rawlib::ffi::LIBRAW_SUCCESS {
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw unpack error {unpack_ret}: {}",
+            libraw_err_str(unpack_ret)
+        ))
+        .with_diagnostics(diag));
+    }
 
-    check_step(
-        unsafe { rawlib::ffi::libraw_unpack(handle.0) },
-        &mut data_error,
-        "unpack",
-    )?;
-    check_step(
-        unsafe { rawlib::ffi::libraw_dcraw_process(handle.0) },
-        &mut data_error,
-        "decode",
-    )?;
+    let process_ret = unsafe { rawlib::ffi::libraw_dcraw_process(handle.0) };
+    diag.process_status = Some(process_ret);
+    if let Some(e) = data_error.take() {
+        diag.data_callback = Some(e.clone());
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw sensor data corruption during decode: {e}"
+        ))
+        .with_diagnostics(diag));
+    }
+    if process_ret != rawlib::ffi::LIBRAW_SUCCESS {
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw decode error {process_ret}: {}",
+            libraw_err_str(process_ret)
+        ))
+        .with_diagnostics(diag));
+    }
 
     let mut errc: c_int = 0;
     let img_ptr = unsafe { rawlib::ffi::libraw_dcraw_make_mem_image(handle.0, &mut errc) };
+    diag.mem_image_status = Some(errc);
     if let Some(err) = data_error.take() {
         if !img_ptr.is_null() {
             unsafe { rawlib::ffi::libraw_dcraw_clear_mem(img_ptr) };
         }
+        diag.data_callback = Some(err.clone());
         return Err(FailureDetail::raw_sensor_data(format!(
             "LibRaw sensor data corruption during image generation: {err}"
-        )));
+        ))
+        .with_diagnostics(diag));
     }
     if img_ptr.is_null() {
         return Err(FailureDetail::raw_sensor_data(format!(
             "LibRaw make_mem_image error {errc}: {}",
             libraw_err_str(errc)
-        )));
+        ))
+        .with_diagnostics(diag));
     }
 
-    Ok(ProcessedImage(img_ptr))
+    Ok((ProcessedImage(img_ptr), diag))
 }
 
 /// Zero-copy RAII wrapper around LibRaw's decoded bitmap buffer.
@@ -232,7 +326,9 @@ impl ProcessedImage {
 
 /// Renders and creates a high-efficiency JPEG from a camera RAW image file, matching suisai.
 pub fn extract_thumbnail<P: AsRef<Path>, Q: AsRef<Path>>(input: P, output: Q) -> Result<()> {
-    test_extract_thumbnail(input, Some(output.as_ref()), false).map_err(|e| anyhow!("{e}"))
+    test_extract_thumbnail(input, Some(output.as_ref()), false)
+        .map(|_| ())
+        .map_err(|e| anyhow!("{e}"))
 }
 
 /// Tests raw decoding and JPEG thumbnail encoding with suisai's exact pipeline parameters.
@@ -240,7 +336,7 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
     input: P,
     output: Option<&Path>,
     half_size: bool,
-) -> Result<(), FailureDetail> {
+) -> Result<LibRawDiagnostics, FailureDetail> {
     let input_path = input.as_ref();
 
     let decode_options = DecodeOptions {
@@ -253,7 +349,7 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
         use_camera_wb: true,
     };
 
-    let image = decode_raw_with_error_handler(input_path, &decode_options)?;
+    let (image, diag) = decode_raw_with_error_handler(input_path, &decode_options)?;
 
     let width = image.width();
     let height = image.height();
@@ -261,7 +357,8 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
     if width == 0 || height == 0 {
         return Err(FailureDetail::raw_sensor_data(format!(
             "Decoded RAW has zero dimensions: {width}x{height}"
-        )));
+        ))
+        .with_diagnostics(diag));
     }
 
     let encoder = Encoder::fastest().quality(JPEG_QUALITY);
@@ -273,6 +370,7 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
                     "Failed to create thumbnail directory {}: {e}",
                     parent.display()
                 ))
+                .with_diagnostics(diag.clone())
             })?;
         }
         let file = File::create(out).map_err(|e| {
@@ -280,6 +378,7 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
                 "Failed to create JPEG output file {}: {e}",
                 out.display()
             ))
+            .with_diagnostics(diag.clone())
         })?;
         if let Err(e) =
             encoder.encode_rgb_to_writer(image.data(), width, height, BufWriter::new(file))
@@ -288,7 +387,8 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
             return Err(FailureDetail::jpeg_encode(format!(
                 "Failed to encode JPEG thumbnail for {}: {e}",
                 out.display()
-            )));
+            ))
+            .with_diagnostics(diag));
         }
     } else {
         encoder
@@ -297,8 +397,9 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
                 FailureDetail::jpeg_encode(format!(
                     "Failed to encode JPEG thumbnail in memory: {e}"
                 ))
+                .with_diagnostics(diag.clone())
             })?;
     }
 
-    Ok(())
+    Ok(diag)
 }

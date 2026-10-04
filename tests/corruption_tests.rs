@@ -35,6 +35,7 @@ async fn test_non_image_garbage_fails_at_search_path() {
         true,
         None,
         None,
+        false,
     )
     .await;
 
@@ -68,6 +69,7 @@ async fn test_truncated_file_fails_at_metadata_extraction() {
         true,
         None,
         None,
+        false,
     )
     .await;
 
@@ -108,6 +110,7 @@ async fn test_non_raw_image_fails_at_thumbnail_extraction() {
         true,
         None,
         None,
+        false,
     )
     .await;
 
@@ -141,6 +144,7 @@ async fn test_corrupted_sensor_stream_fails_at_raw_sensor_data() {
         true,
         None,
         None,
+        false,
     )
     .await;
 
@@ -168,6 +172,7 @@ async fn test_valid_camera_raw_passes_ingest() {
         true,
         None,
         None,
+        false,
     )
     .await;
 
@@ -258,6 +263,7 @@ async fn test_truncated_sensor_strip_fails_at_metadata_stage() {
         true,
         None,
         None,
+        false,
     )
     .await;
 
@@ -286,6 +292,7 @@ async fn test_corrupted_files_exported_to_log() {
         true,
         None,
         Some(log_path.clone()),
+        false,
     )
     .await;
 
@@ -321,11 +328,61 @@ fn test_libraw_data_error_callback_catches_corruption() {
         res.is_err(),
         "Expected error from LibRaw on corrupted sensor stream"
     );
-    let err_msg = res.unwrap_err().to_string();
+    let err = res.unwrap_err();
+    let err_msg = err.to_string();
     assert!(
         err_msg.contains("LibRaw")
             || err_msg.contains("unexpected end of file")
             || err_msg.contains("corruption"),
         "Error message did not contain expected LibRaw details: {err_msg}"
+    );
+    assert!(
+        err.diagnostics.is_some(),
+        "Expected diagnostics to be attached to FailureDetail"
+    );
+    let diag = err.diagnostics.unwrap();
+    assert_eq!(diag.open_status, 0);
+    assert!(diag.open_route.contains("libraw_open_file"));
+}
+
+#[test]
+fn test_libraw_version_and_dcraw_emu_comparison() {
+    let tool_ver = rawcorrupt::libraw_version_string();
+    assert!(
+        !tool_ver.is_empty(),
+        "libraw_version_string must not be empty"
+    );
+    assert!(tool_ver.starts_with("0.") || tool_ver.starts_with("1."));
+
+    let dcraw_ver = rawcorrupt::detect_dcraw_emu_version();
+    if std::path::Path::new("/usr/bin/dcraw_emu").exists() {
+        assert!(
+            dcraw_ver.is_some(),
+            "Expected dcraw_emu version to be detected"
+        );
+        let sys_ver = dcraw_ver.unwrap();
+        println!("Tool LibRaw: {tool_ver}, System dcraw_emu: {sys_ver}");
+        assert!(sys_ver.contains("0.22.2"));
+    }
+}
+
+#[test]
+fn test_libraw_diagnostics_logged_on_decode() {
+    let sample_raw = PathBuf::from("/home/kaneki/suisai-test/original_raws/_DSC0326.ARW");
+    if !sample_raw.exists() {
+        eprintln!("Skipping test: test raw not found");
+        return;
+    }
+
+    let diag = test_extract_thumbnail(&sample_raw, None, true).expect("Valid raw should decode");
+    assert_eq!(diag.open_status, 0);
+    assert_eq!(diag.unpack_status, Some(0));
+    assert_eq!(diag.process_status, Some(0));
+    assert!(diag.open_route.contains("libraw_open_file"));
+    assert!(diag.status_summary().contains("open=0 (LIBRAW_SUCCESS)"));
+    assert!(diag.status_summary().contains("unpack=0 (LIBRAW_SUCCESS)"));
+    assert!(
+        diag.status_summary()
+            .contains("dcraw_process=0 (LIBRAW_SUCCESS)")
     );
 }
