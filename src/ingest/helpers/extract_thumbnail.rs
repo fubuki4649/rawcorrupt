@@ -109,29 +109,10 @@ fn decode_raw_with_error_handler(
         );
     }
 
-    #[cfg(windows)]
-    let ret = {
-        use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = input_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        unsafe { rawlib::ffi::libraw_open_wfile(handle.0, wide.as_ptr()) }
-    };
-
-    #[cfg(not(windows))]
-    let ret = {
-        let path_str = input_path.to_str().ok_or_else(|| {
-            FailureDetail::file_read(format!(
-                "Invalid UTF-8 path encoding: {}",
-                input_path.display()
-            ))
-        })?;
-        let c_path = CString::new(path_str)
-            .map_err(|e| FailureDetail::file_read(format!("Path contains null byte: {e}")))?;
-        unsafe { rawlib::ffi::libraw_open_file(handle.0, c_path.as_ptr()) }
-    };
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(input_path.as_os_str().as_bytes())
+        .map_err(|e| FailureDetail::file_read(format!("Path contains null byte: {e}")))?;
+    let ret = unsafe { rawlib::ffi::libraw_open_file(handle.0, c_path.as_ptr()) };
 
     if ret != rawlib::ffi::LIBRAW_SUCCESS {
         return Err(map_libraw_open_error(ret));
