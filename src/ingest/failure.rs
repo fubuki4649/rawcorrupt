@@ -102,3 +102,11 @@ impl fmt::Display for FailureDetail {
 }
 
 impl std::error::Error for FailureDetail {}
+
+/// Record of a corrupted file with its absolute path and failure details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorruptedFile {
+    pub path: std::path::PathBuf,
+    pub category: FailureCategory,
+    pub error: String,
+}

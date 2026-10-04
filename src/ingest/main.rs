@@ -1,4 +1,4 @@
-use crate::ingest::failure::{FailureCategory, FailureDetail};
+use crate::ingest::failure::{CorruptedFile, FailureCategory, FailureDetail};
 use crate::ingest::helpers::extract_thumbnail::test_extract_thumbnail;
 use crate::ingest::helpers::hash_and_transfer::hash_and_read;
 use crate::ingest::helpers::search_path::{is_image_by_infer, search_path_for_assets};
@@ -21,6 +21,7 @@ pub struct IngestSummary {
     pub failed: usize,
     pub total_bytes: u64,
     pub failure_breakdown: HashMap<FailureCategory, usize>,
+    pub corrupted_files: Vec<CorruptedFile>,
     pub duration_ms: u64,
 }
 
@@ -31,6 +32,7 @@ pub async fn ingest(
     threads: Option<usize>,
     half_size: bool,
     save_thumbnails: Option<PathBuf>,
+    log_file: Option<PathBuf>,
 ) -> IngestSummary {
     let target = PathBuf::from(&path);
     let start_time = Instant::now();
@@ -179,6 +181,14 @@ pub async fn ingest(
                     if let Some(ref fail) = failure {
                         s.failed += 1;
                         *s.failure_breakdown.entry(fail.category).or_insert(0) += 1;
+                        let abs_path = std::fs::canonicalize(&path).unwrap_or_else(|_| {
+                            std::path::absolute(&path).unwrap_or_else(|_| path.clone())
+                        });
+                        s.corrupted_files.push(CorruptedFile {
+                            path: abs_path,
+                            category: fail.category,
+                            error: fail.message.clone(),
+                        });
                     } else {
                         s.passed += 1;
                     }
@@ -247,8 +257,41 @@ pub async fn ingest(
 
     let mut final_summary = Arc::try_unwrap(summary).unwrap().into_inner();
     final_summary.duration_ms = start_time.elapsed().as_millis() as u64;
+    final_summary
+        .corrupted_files
+        .sort_by(|a, b| a.path.cmp(&b.path));
 
     print_ingest_summary(&final_summary);
+
+    if let Some(ref log_path) = log_file
+        && !final_summary.corrupted_files.is_empty()
+    {
+        let mut log_content = String::new();
+        for item in &final_summary.corrupted_files {
+            log_content.push_str(&item.path.display().to_string());
+            log_content.push('\n');
+        }
+        match tokio::fs::write(log_path, log_content).await {
+            Ok(()) => {
+                println!(
+                    "{} Exported {} corrupted file path(s) to {}",
+                    "✓".green().bold(),
+                    final_summary.corrupted_files.len().to_string().bold(),
+                    log_path.display().to_string().yellow().bold()
+                );
+                println!();
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to write corrupted log to {}: {e}",
+                    "Warning:".yellow().bold(),
+                    log_path.display()
+                );
+                eprintln!();
+            }
+        }
+    }
+
     final_summary
 }
 

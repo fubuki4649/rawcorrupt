@@ -25,11 +25,32 @@ pub struct Cli {
     /// Optional directory to save successfully generated JPEG thumbnails
     #[arg(long = "save-thumbnails", value_name = "DIR")]
     pub save_thumbnails: Option<PathBuf>,
+
+    /// Path to export list of corrupted files (default: corrupted.log)
+    #[arg(
+        short = 'l',
+        long = "log",
+        value_name = "FILE",
+        default_value = "corrupted.log"
+    )]
+    pub log: PathBuf,
+
+    /// Disable exporting corrupted files to a log file
+    #[arg(long = "no-log", default_value_t = false)]
+    pub no_log: bool,
 }
 
 pub async fn run_cli() {
     let cli = Cli::parse();
-    let summary = ingest(cli.source, cli.threads, cli.half_size, cli.save_thumbnails).await;
+    let log_file = if cli.no_log { None } else { Some(cli.log) };
+    let summary = ingest(
+        cli.source,
+        cli.threads,
+        cli.half_size,
+        cli.save_thumbnails,
+        log_file,
+    )
+    .await;
 
     if summary.failed > 0 {
         std::process::exit(1);

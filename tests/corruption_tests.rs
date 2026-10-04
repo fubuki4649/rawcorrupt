@@ -34,6 +34,7 @@ async fn test_non_image_garbage_fails_at_search_path() {
         Some(1),
         true,
         None,
+        None,
     )
     .await;
 
@@ -65,6 +66,7 @@ async fn test_truncated_file_fails_at_metadata_extraction() {
         truncated_path.to_str().unwrap().to_string(),
         Some(1),
         true,
+        None,
         None,
     )
     .await;
@@ -105,6 +107,7 @@ async fn test_non_raw_image_fails_at_thumbnail_extraction() {
         Some(1),
         true,
         None,
+        None,
     )
     .await;
 
@@ -137,6 +140,7 @@ async fn test_corrupted_sensor_stream_fails_at_raw_sensor_data() {
         Some(1),
         true,
         None,
+        None,
     )
     .await;
 
@@ -162,6 +166,7 @@ async fn test_valid_camera_raw_passes_ingest() {
         sample_raw.to_str().unwrap().to_string(),
         Some(1),
         true,
+        None,
         None,
     )
     .await;
@@ -252,6 +257,7 @@ async fn test_truncated_sensor_strip_fails_at_metadata_stage() {
         Some(1),
         true,
         None,
+        None,
     )
     .await;
 
@@ -262,6 +268,35 @@ async fn test_truncated_sensor_strip_fails_at_metadata_stage() {
             .failure_breakdown
             .get(&FailureCategory::RawSensorData),
         Some(&1)
+    );
+}
+
+#[tokio::test]
+async fn test_corrupted_files_exported_to_log() {
+    let dir = tempdir().unwrap();
+    let garbage_path = dir.path().join("corrupt_file.ARW");
+    let mut file = File::create(&garbage_path).unwrap();
+    file.write_all(b"GARBAGE NON RAW HEADER").unwrap();
+
+    let log_path = dir.path().join("corrupted.log");
+
+    let summary = ingest(
+        garbage_path.to_str().unwrap().to_string(),
+        Some(1),
+        true,
+        None,
+        Some(log_path.clone()),
+    )
+    .await;
+
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.corrupted_files.len(), 1);
+    assert!(log_path.exists(), "corrupted.log must be created");
+
+    let log_content = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log_content.contains(garbage_path.file_name().unwrap().to_str().unwrap()),
+        "corrupted.log must contain the file path: {log_content}"
     );
 }
 
