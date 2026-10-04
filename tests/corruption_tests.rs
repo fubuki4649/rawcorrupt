@@ -198,3 +198,65 @@ async fn test_search_path_for_assets() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0], raw1);
 }
+
+#[tokio::test]
+async fn test_truncated_sensor_strip_fails_at_metadata_stage() {
+    let sample_raw = PathBuf::from("/home/kaneki/suisai-test/original_raws/_DSC0826.ARW");
+    if !sample_raw.exists() {
+        eprintln!("Skipping test: test raw not found");
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let truncated_path = dir.path().join("truncated_sensor.ARW");
+
+    // Copy and truncate 2MB off the sensor data at the end
+    let raw_bytes = fs::read(&sample_raw).unwrap();
+    let truncated_bytes = &raw_bytes[..raw_bytes.len() - 2_000_000];
+    fs::write(&truncated_path, truncated_bytes).unwrap();
+
+    let summary = ingest(
+        truncated_path.to_str().unwrap().to_string(),
+        Some(1),
+        true,
+        None,
+    )
+    .await;
+
+    assert_eq!(summary.total, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(
+        summary.stage_failures.get(&IngestStage::MetadataExtraction),
+        Some(&1)
+    );
+}
+
+#[test]
+fn test_libraw_data_error_callback_catches_corruption() {
+    let sample_dng = PathBuf::from(
+        "/home/kaneki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/czkawka_core-12.0.2/src/common/test_assets/test_raw.dng",
+    );
+    if !sample_dng.exists() {
+        eprintln!("Skipping test: sample dng not found");
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let trunc_dng = dir.path().join("trunc.dng");
+    let dng_bytes = fs::read(&sample_dng).unwrap();
+    fs::write(&trunc_dng, &dng_bytes[..dng_bytes.len() - 500]).unwrap();
+
+    // Directly test Stage 4 decode: must return Err with LibRaw corruption details
+    let res = test_extract_thumbnail(&trunc_dng, None, false);
+    assert!(
+        res.is_err(),
+        "Expected error from LibRaw on corrupted sensor stream"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("LibRaw")
+            || err_msg.contains("unexpected end of file")
+            || err_msg.contains("corruption"),
+        "Error message did not contain expected LibRaw details: {err_msg}"
+    );
+}

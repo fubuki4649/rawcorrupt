@@ -191,6 +191,70 @@ impl SuisaiAsset for PathBuf {
             return Err(anyhow!("ExifTool reported corrupted metadata: {err}"));
         }
 
+        if let Some(warning) = info.get("Warning") {
+            let warn_lower = warning.to_lowercase();
+            if warn_lower.contains("past end of file")
+                || warn_lower.contains("corrupt")
+                || warn_lower.contains("truncated")
+                || warn_lower.contains("bad subifd")
+                || warn_lower.contains("bad ifd")
+                || warn_lower.contains("premature end of file")
+                || warn_lower.contains("error reading")
+            {
+                return Err(anyhow!(
+                    "ExifTool detected corrupted file structure: {warning}"
+                ));
+            }
+        }
+
+        // Validate that sensor data strips or tiles do not extend beyond the actual file length
+        let file_size_bytes = fs::metadata(self).map(|m| m.len()).unwrap_or(0);
+        if file_size_bytes > 0 {
+            if let (Some(offsets_str), Some(counts_str)) =
+                (info.get("StripOffsets"), info.get("StripByteCounts"))
+            {
+                let last_offset = offsets_str
+                    .split_whitespace()
+                    .last()
+                    .and_then(|s| s.parse::<u64>().ok());
+                let last_count = counts_str
+                    .split_whitespace()
+                    .last()
+                    .and_then(|s| s.parse::<u64>().ok());
+                if let (Some(offset), Some(count)) = (last_offset, last_count)
+                    && offset.saturating_add(count) > file_size_bytes
+                {
+                    return Err(anyhow!(
+                        "File truncated: sensor data strip ends at byte {} but file is only {} bytes",
+                        offset + count,
+                        file_size_bytes
+                    ));
+                }
+            }
+
+            if let (Some(offsets_str), Some(counts_str)) =
+                (info.get("TileOffsets"), info.get("TileByteCounts"))
+            {
+                let last_offset = offsets_str
+                    .split_whitespace()
+                    .last()
+                    .and_then(|s| s.parse::<u64>().ok());
+                let last_count = counts_str
+                    .split_whitespace()
+                    .last()
+                    .and_then(|s| s.parse::<u64>().ok());
+                if let (Some(offset), Some(count)) = (last_offset, last_count)
+                    && offset.saturating_add(count) > file_size_bytes
+                {
+                    return Err(anyhow!(
+                        "File truncated: sensor data tile ends at byte {} but file is only {} bytes",
+                        offset + count,
+                        file_size_bytes
+                    ));
+                }
+            }
+        }
+
         let res = self.get_resolution(&info);
         if res[0] <= 0 && res[1] <= 0 {
             return Err(anyhow!(
