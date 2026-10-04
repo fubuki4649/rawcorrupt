@@ -1,12 +1,18 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use mozjpeg_rs::Encoder;
-use rawlib::{DecodeOptions, ImageFormat, ThumbnailData};
+use rawlib::DecodeOptions;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::{File, create_dir_all, remove_file};
-use std::io::{BufWriter, Cursor};
+use std::io::BufWriter;
 use std::path::Path;
 
 pub const JPEG_QUALITY: u8 = 82;
+
+const LIBRAW_FILE_UNSUPPORTED: c_int = -2;
+const LIBRAW_NO_THUMBNAIL: c_int = -5;
+const LIBRAW_UNSUPPORTED_THUMBNAIL: c_int = -6;
+const LIBRAW_DATA_ERROR: c_int = -100008;
+const LIBRAW_IO_ERROR: c_int = -100009;
 
 unsafe extern "C" {
     fn libraw_set_dataerror_handler(
@@ -49,15 +55,25 @@ unsafe extern "C" fn raw_data_error_callback(data: *mut c_void, file: *const c_c
     }
 }
 
+use crate::ingest::failure::FailureDetail;
+
 /// Decodes camera RAW data using LibRaw while catching internal sensor corruption callbacks.
-fn decode_raw_with_error_handler(input_path: &Path, opts: &DecodeOptions) -> Result<ThumbnailData> {
+fn decode_raw_with_error_handler(
+    input_path: &Path,
+    opts: &DecodeOptions,
+) -> Result<ProcessedImage, FailureDetail> {
     if !input_path.exists() {
-        return Err(anyhow!("File does not exist: {}", input_path.display()));
+        return Err(FailureDetail::file_read(format!(
+            "File does not exist: {}",
+            input_path.display()
+        )));
     }
 
     let handle = RawHandle(unsafe { rawlib::ffi::libraw_init(rawlib::ffi::LIBRAW_OPTIONS_NONE) });
     if handle.0.is_null() {
-        return Err(anyhow!("Failed to initialize LibRaw processor"));
+        return Err(FailureDetail::raw_sensor_data(
+            "Failed to initialize LibRaw processor",
+        ));
     }
 
     let mut data_error: Option<String> = None;
@@ -81,26 +97,76 @@ fn decode_raw_with_error_handler(input_path: &Path, opts: &DecodeOptions) -> Res
         if ret != rawlib::ffi::LIBRAW_SUCCESS {
             let err_c = unsafe { rawlib::ffi::libraw_strerror(ret) };
             let err_str = unsafe { CStr::from_ptr(err_c) }.to_string_lossy();
-            return Err(anyhow!("LibRaw open_file error {ret}: {err_str}"));
+            if ret == LIBRAW_IO_ERROR {
+                return Err(FailureDetail::file_read(format!(
+                    "LibRaw read I/O error {ret}: {err_str}"
+                )));
+            } else if ret == LIBRAW_FILE_UNSUPPORTED {
+                return Err(FailureDetail::metadata(format!(
+                    "Unsupported camera RAW format: {err_str}"
+                )));
+            } else {
+                return Err(FailureDetail::raw_sensor_data(format!(
+                    "LibRaw open_file error {ret}: {err_str}"
+                )));
+            }
         }
     }
 
     #[cfg(not(windows))]
     {
-        let path_str = input_path
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid UTF-8 path encoding: {}", input_path.display()))?;
-        let c_path = CString::new(path_str).map_err(|e| anyhow!("Path contains null byte: {e}"))?;
+        let path_str = input_path.to_str().ok_or_else(|| {
+            FailureDetail::file_read(format!(
+                "Invalid UTF-8 path encoding: {}",
+                input_path.display()
+            ))
+        })?;
+        let c_path = CString::new(path_str)
+            .map_err(|e| FailureDetail::file_read(format!("Path contains null byte: {e}")))?;
         let ret = unsafe { rawlib::ffi::libraw_open_file(handle.0, c_path.as_ptr()) };
         if ret != rawlib::ffi::LIBRAW_SUCCESS {
             let err_c = unsafe { rawlib::ffi::libraw_strerror(ret) };
             let err_str = unsafe { CStr::from_ptr(err_c) }.to_string_lossy();
-            return Err(anyhow!("LibRaw open_file error {ret}: {err_str}"));
+            if ret == LIBRAW_IO_ERROR {
+                return Err(FailureDetail::file_read(format!(
+                    "LibRaw read I/O error {ret}: {err_str}"
+                )));
+            } else if ret == LIBRAW_FILE_UNSUPPORTED {
+                return Err(FailureDetail::metadata(format!(
+                    "Unsupported camera RAW format: {err_str}"
+                )));
+            } else {
+                return Err(FailureDetail::raw_sensor_data(format!(
+                    "LibRaw open_file error {ret}: {err_str}"
+                )));
+            }
         }
     }
 
     if let Some(err) = data_error.take() {
-        return Err(anyhow!("LibRaw data corruption during open: {err}"));
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw data corruption during open: {err}"
+        )));
+    }
+
+    // Verify embedded thumbnail if present in camera RAW file
+    let thumb_ret = unsafe { rawlib::ffi::libraw_unpack_thumb(handle.0) };
+    if let Some(err) = data_error.take() {
+        return Err(FailureDetail::embedded_thumbnail(format!(
+            "Corrupted embedded thumbnail in RAW file: {err}"
+        )));
+    }
+    if thumb_ret != rawlib::ffi::LIBRAW_SUCCESS
+        && thumb_ret != LIBRAW_NO_THUMBNAIL
+        && thumb_ret != LIBRAW_UNSUPPORTED_THUMBNAIL
+    {
+        let err_c = unsafe { rawlib::ffi::libraw_strerror(thumb_ret) };
+        let err_str = unsafe { CStr::from_ptr(err_c) }.to_string_lossy();
+        if thumb_ret == LIBRAW_DATA_ERROR {
+            return Err(FailureDetail::embedded_thumbnail(format!(
+                "Corrupted embedded thumbnail stream: {err_str}"
+            )));
+        }
     }
 
     unsafe {
@@ -118,26 +184,30 @@ fn decode_raw_with_error_handler(input_path: &Path, opts: &DecodeOptions) -> Res
 
     let ret = unsafe { rawlib::ffi::libraw_unpack(handle.0) };
     if let Some(err) = data_error.take() {
-        return Err(anyhow!(
+        return Err(FailureDetail::raw_sensor_data(format!(
             "LibRaw sensor data corruption during unpack: {err}"
-        ));
+        )));
     }
     if ret != rawlib::ffi::LIBRAW_SUCCESS {
         let err_c = unsafe { rawlib::ffi::libraw_strerror(ret) };
         let err_str = unsafe { CStr::from_ptr(err_c) }.to_string_lossy();
-        return Err(anyhow!("LibRaw unpack error {ret}: {err_str}"));
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw unpack error {ret}: {err_str}"
+        )));
     }
 
     let ret = unsafe { rawlib::ffi::libraw_dcraw_process(handle.0) };
     if let Some(err) = data_error.take() {
-        return Err(anyhow!(
+        return Err(FailureDetail::raw_sensor_data(format!(
             "LibRaw sensor data corruption during decode: {err}"
-        ));
+        )));
     }
     if ret != rawlib::ffi::LIBRAW_SUCCESS {
         let err_c = unsafe { rawlib::ffi::libraw_strerror(ret) };
         let err_str = unsafe { CStr::from_ptr(err_c) }.to_string_lossy();
-        return Err(anyhow!("LibRaw process error {ret}: {err_str}"));
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw process error {ret}: {err_str}"
+        )));
     }
 
     let mut errc: c_int = 0;
@@ -146,41 +216,52 @@ fn decode_raw_with_error_handler(input_path: &Path, opts: &DecodeOptions) -> Res
         if !img_ptr.is_null() {
             unsafe { rawlib::ffi::libraw_dcraw_clear_mem(img_ptr) };
         }
-        return Err(anyhow!(
+        return Err(FailureDetail::raw_sensor_data(format!(
             "LibRaw sensor data corruption during image generation: {err}"
-        ));
+        )));
     }
     if img_ptr.is_null() {
         let err_c = unsafe { rawlib::ffi::libraw_strerror(errc) };
         let err_str = unsafe { CStr::from_ptr(err_c) }.to_string_lossy();
-        return Err(anyhow!("LibRaw make_mem_image error {errc}: {err_str}"));
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "LibRaw make_mem_image error {errc}: {err_str}"
+        )));
     }
 
-    let img = unsafe { &*img_ptr };
-    let width = img.width;
-    let height = img.height;
-    let colors = img.colors;
-    let bits = img.bits;
-    let data_size = img.data_size as usize;
-    let data = unsafe { std::slice::from_raw_parts(img.data.as_ptr(), data_size).to_vec() };
+    Ok(ProcessedImage(img_ptr))
+}
 
-    unsafe {
-        rawlib::ffi::libraw_dcraw_clear_mem(img_ptr);
+/// Zero-copy RAII wrapper around LibRaw's decoded bitmap buffer.
+pub struct ProcessedImage(*mut rawlib::ffi::libraw_processed_image_t);
+
+impl Drop for ProcessedImage {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { rawlib::ffi::libraw_dcraw_clear_mem(self.0) };
+        }
+    }
+}
+
+impl ProcessedImage {
+    pub fn width(&self) -> u32 {
+        unsafe { (*self.0).width as u32 }
     }
 
-    Ok(ThumbnailData {
-        format: ImageFormat::Bitmap,
-        width,
-        height,
-        colors,
-        bits,
-        data,
-    })
+    pub fn height(&self) -> u32 {
+        unsafe { (*self.0).height as u32 }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        unsafe {
+            let img = &*self.0;
+            std::slice::from_raw_parts(img.data.as_ptr(), img.data_size as usize)
+        }
+    }
 }
 
 /// Renders and creates a high-efficiency JPEG from a camera RAW image file, matching suisai.
 pub fn extract_thumbnail<P: AsRef<Path>, Q: AsRef<Path>>(input: P, output: Q) -> Result<()> {
-    test_extract_thumbnail(input, Some(output.as_ref()), false)
+    test_extract_thumbnail(input, Some(output.as_ref()), false).map_err(|e| anyhow!("{e}"))
 }
 
 /// Tests raw decoding and JPEG thumbnail encoding with suisai's exact pipeline parameters.
@@ -188,7 +269,7 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
     input: P,
     output: Option<&Path>,
     half_size: bool,
-) -> Result<()> {
+) -> Result<(), FailureDetail> {
     let input_path = input.as_ref();
 
     let decode_options = DecodeOptions {
@@ -201,56 +282,50 @@ pub fn test_extract_thumbnail<P: AsRef<Path>>(
         use_camera_wb: true,
     };
 
-    let image = decode_raw_with_error_handler(input_path, &decode_options)
-        .map_err(|e| anyhow!("Failed to decode RAW from {}: {e}", input_path.display()))?;
+    let image = decode_raw_with_error_handler(input_path, &decode_options)?;
 
-    if image.width == 0 || image.height == 0 {
-        return Err(anyhow!(
-            "Decoded RAW has zero dimensions: {}x{}",
-            image.width,
-            image.height
-        ));
+    let width = image.width();
+    let height = image.height();
+
+    if width == 0 || height == 0 {
+        return Err(FailureDetail::raw_sensor_data(format!(
+            "Decoded RAW has zero dimensions: {width}x{height}"
+        )));
     }
 
     let encoder = Encoder::fastest().quality(JPEG_QUALITY);
 
     if let Some(output_path) = output {
         if let Some(parent) = output_path.parent() {
-            create_dir_all(parent).with_context(|| {
-                format!("Failed to create thumbnail directory {}", parent.display())
+            create_dir_all(parent).map_err(|e| {
+                FailureDetail::jpeg_encode(format!(
+                    "Failed to create thumbnail directory {}: {e}",
+                    parent.display()
+                ))
             })?;
         }
 
-        let file = File::create(output_path).with_context(|| {
-            format!(
-                "Failed to create JPEG output file {}",
+        let file = File::create(output_path).map_err(|e| {
+            FailureDetail::jpeg_encode(format!(
+                "Failed to create JPEG output file {}: {e}",
                 output_path.display()
-            )
+            ))
         })?;
         let writer = BufWriter::new(file);
 
-        if let Err(e) = encoder.encode_rgb_to_writer(
-            &image.data,
-            image.width as u32,
-            image.height as u32,
-            writer,
-        ) {
+        if let Err(e) = encoder.encode_rgb_to_writer(image.data(), width, height, writer) {
             let _ = remove_file(output_path);
-            return Err(anyhow!(
+            return Err(FailureDetail::jpeg_encode(format!(
                 "Failed to encode JPEG thumbnail for {}: {e}",
                 output_path.display()
-            ));
+            )));
         }
-    } else {
-        let mut sink = Cursor::new(Vec::new());
-        if let Err(e) = encoder.encode_rgb_to_writer(
-            &image.data,
-            image.width as u32,
-            image.height as u32,
-            &mut sink,
-        ) {
-            return Err(anyhow!("Failed to encode JPEG thumbnail in memory: {e}"));
-        }
+    } else if let Err(e) =
+        encoder.encode_rgb_to_writer(image.data(), width, height, &mut std::io::sink())
+    {
+        return Err(FailureDetail::jpeg_encode(format!(
+            "Failed to encode JPEG thumbnail in memory: {e}"
+        )));
     }
 
     Ok(())

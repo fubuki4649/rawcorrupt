@@ -1,5 +1,5 @@
 use crate::models::asset::NewDbAsset;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use exiftool_rs::{ImageInfo, image_info};
 use std::fs;
@@ -54,7 +54,11 @@ pub trait SuisaiAsset {
     fn to_db_entry(&self, hash: String, size_on_disk: i64) -> NewDbAsset;
 
     /// Validating variant for corruption testing that fails if ExifTool errors or dimensions are invalid.
-    fn try_to_db_entry(&self, hash: String, size_on_disk: i64) -> Result<NewDbAsset>;
+    fn try_to_db_entry(
+        &self,
+        hash: String,
+        size_on_disk: i64,
+    ) -> Result<NewDbAsset, crate::ingest::failure::FailureDetail>;
 }
 
 impl SuisaiAsset for PathBuf {
@@ -184,16 +188,56 @@ impl SuisaiAsset for PathBuf {
         }
     }
 
-    fn try_to_db_entry(&self, hash: String, size_on_disk: i64) -> Result<NewDbAsset> {
-        let info = image_info(self).map_err(|e| anyhow!("ExifTool execution failed: {e}"))?;
+    fn try_to_db_entry(
+        &self,
+        hash: String,
+        size_on_disk: i64,
+    ) -> Result<NewDbAsset, crate::ingest::failure::FailureDetail> {
+        use crate::ingest::failure::FailureDetail;
+
+        let info = match image_info(self) {
+            Ok(info) => info,
+            Err(e) => {
+                let err_str = e.to_string();
+                let lower = err_str.to_lowercase();
+                if lower.contains("no such file") || lower.contains("permission denied") {
+                    return Err(FailureDetail::file_read(format!(
+                        "Cannot read file for metadata extraction: {err_str}"
+                    )));
+                } else {
+                    return Err(FailureDetail::metadata(format!(
+                        "ExifTool execution failed: {err_str}"
+                    )));
+                }
+            }
+        };
 
         if let Some(err) = info.get("Error") {
-            return Err(anyhow!("ExifTool reported corrupted metadata: {err}"));
+            let err_lower = err.to_lowercase();
+            if err_lower.contains("previewimage")
+                || err_lower.contains("thumbnailimage")
+                || err_lower.contains("jpgfromraw")
+            {
+                return Err(FailureDetail::embedded_thumbnail(format!(
+                    "ExifTool reported corrupted embedded preview/thumbnail: {err}"
+                )));
+            } else {
+                return Err(FailureDetail::metadata(format!(
+                    "ExifTool reported corrupted metadata: {err}"
+                )));
+            }
         }
 
         if let Some(warning) = info.get("Warning") {
             let warn_lower = warning.to_lowercase();
-            if warn_lower.contains("past end of file")
+            if warn_lower.contains("previewimage")
+                || warn_lower.contains("thumbnailimage")
+                || warn_lower.contains("jpgfromraw")
+            {
+                return Err(FailureDetail::embedded_thumbnail(format!(
+                    "ExifTool reported corrupted embedded preview/thumbnail: {warning}"
+                )));
+            } else if warn_lower.contains("past end of file")
                 || warn_lower.contains("corrupt")
                 || warn_lower.contains("truncated")
                 || warn_lower.contains("bad subifd")
@@ -201,9 +245,9 @@ impl SuisaiAsset for PathBuf {
                 || warn_lower.contains("premature end of file")
                 || warn_lower.contains("error reading")
             {
-                return Err(anyhow!(
+                return Err(FailureDetail::metadata(format!(
                     "ExifTool detected corrupted file structure: {warning}"
-                ));
+                )));
             }
         }
 
@@ -224,11 +268,11 @@ impl SuisaiAsset for PathBuf {
                 if let (Some(offset), Some(count)) = (last_offset, last_count)
                     && offset.saturating_add(count) > file_size_bytes
                 {
-                    return Err(anyhow!(
+                    return Err(FailureDetail::raw_sensor_data(format!(
                         "File truncated: sensor data strip ends at byte {} but file is only {} bytes",
                         offset + count,
                         file_size_bytes
-                    ));
+                    )));
                 }
             }
 
@@ -246,22 +290,21 @@ impl SuisaiAsset for PathBuf {
                 if let (Some(offset), Some(count)) = (last_offset, last_count)
                     && offset.saturating_add(count) > file_size_bytes
                 {
-                    return Err(anyhow!(
+                    return Err(FailureDetail::raw_sensor_data(format!(
                         "File truncated: sensor data tile ends at byte {} but file is only {} bytes",
                         offset + count,
                         file_size_bytes
-                    ));
+                    )));
                 }
             }
         }
 
         let res = self.get_resolution(&info);
         if res[0] <= 0 && res[1] <= 0 {
-            return Err(anyhow!(
+            return Err(FailureDetail::metadata(format!(
                 "Missing or invalid image dimensions in EXIF metadata (width: {}, height: {})",
-                res[0],
-                res[1]
-            ));
+                res[0], res[1]
+            )));
         }
 
         Ok(NewDbAsset {

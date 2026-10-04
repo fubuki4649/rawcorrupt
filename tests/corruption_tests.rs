@@ -1,8 +1,8 @@
+use rawcorrupt::FailureCategory;
 use rawcorrupt::ingest::helpers::extract_thumbnail::{extract_thumbnail, test_extract_thumbnail};
 use rawcorrupt::ingest::helpers::hash_and_transfer::hash_and_read;
 use rawcorrupt::ingest::helpers::search_path::search_path_for_assets;
 use rawcorrupt::ingest::main::ingest;
-use rawcorrupt::ingest::stage::IngestStage;
 use rawcorrupt::ingest::traits::SuisaiAsset;
 use std::fs::{self, File};
 use std::io::Write;
@@ -40,7 +40,7 @@ async fn test_non_image_garbage_fails_at_search_path() {
     assert_eq!(summary.total, 1);
     assert_eq!(summary.failed, 1);
     assert_eq!(
-        summary.stage_failures.get(&IngestStage::SearchPath),
+        summary.failure_breakdown.get(&FailureCategory::FileRead),
         Some(&1)
     );
 }
@@ -72,7 +72,7 @@ async fn test_truncated_file_fails_at_metadata_extraction() {
     assert_eq!(summary.total, 1);
     assert_eq!(summary.failed, 1);
     assert_eq!(
-        summary.stage_failures.get(&IngestStage::MetadataExtraction),
+        summary.failure_breakdown.get(&FailureCategory::Metadata),
         Some(&1)
     );
 }
@@ -111,9 +111,41 @@ async fn test_non_raw_image_fails_at_thumbnail_extraction() {
     assert_eq!(summary.total, 1);
     assert_eq!(summary.failed, 1);
     assert_eq!(
+        summary.failure_breakdown.get(&FailureCategory::Metadata),
+        Some(&1)
+    );
+}
+
+#[tokio::test]
+async fn test_corrupted_sensor_stream_fails_at_raw_sensor_data() {
+    let sample_dng = PathBuf::from(
+        "/home/kaneki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/czkawka_core-12.0.2/src/common/test_assets/test_raw.dng",
+    );
+    if !sample_dng.exists() {
+        eprintln!("Skipping test: sample dng not found");
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let corrupt_dng = dir.path().join("corrupt_sensor.dng");
+    let dng_bytes = fs::read(&sample_dng).unwrap();
+    // Truncate sensor stream so sensor data strip is missing bytes
+    fs::write(&corrupt_dng, &dng_bytes[..dng_bytes.len() - 500]).unwrap();
+
+    let summary = ingest(
+        corrupt_dng.to_str().unwrap().to_string(),
+        Some(1),
+        true,
+        None,
+    )
+    .await;
+
+    assert_eq!(summary.total, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(
         summary
-            .stage_failures
-            .get(&IngestStage::ThumbnailExtraction),
+            .failure_breakdown
+            .get(&FailureCategory::RawSensorData),
         Some(&1)
     );
 }
@@ -226,7 +258,9 @@ async fn test_truncated_sensor_strip_fails_at_metadata_stage() {
     assert_eq!(summary.total, 1);
     assert_eq!(summary.failed, 1);
     assert_eq!(
-        summary.stage_failures.get(&IngestStage::MetadataExtraction),
+        summary
+            .failure_breakdown
+            .get(&FailureCategory::RawSensorData),
         Some(&1)
     );
 }

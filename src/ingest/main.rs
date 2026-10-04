@@ -1,7 +1,7 @@
+use crate::ingest::failure::{FailureCategory, FailureDetail};
 use crate::ingest::helpers::extract_thumbnail::test_extract_thumbnail;
 use crate::ingest::helpers::hash_and_transfer::hash_and_read;
 use crate::ingest::helpers::search_path::{is_image_by_infer, search_path_for_assets};
-use crate::ingest::stage::IngestStage;
 use crate::ingest::traits::SuisaiAsset;
 use crate::models::asset::NewDbAsset;
 use colored::*;
@@ -20,7 +20,7 @@ pub struct IngestSummary {
     pub passed: usize,
     pub failed: usize,
     pub total_bytes: u64,
-    pub stage_failures: HashMap<IngestStage, usize>,
+    pub failure_breakdown: HashMap<FailureCategory, usize>,
     pub duration_ms: u64,
 }
 
@@ -62,6 +62,15 @@ pub async fn ingest(
             .get()
     });
 
+    // When running parallel workers across multiple files, limit OpenMP per-file
+    // internal demosaicing threads to 1 to prevent severe CPU oversubscription.
+    if std::env::var_os("OMP_NUM_THREADS").is_none() && available_threads > 1 {
+        // SAFETY: Set before any LibRaw processing begins.
+        unsafe {
+            std::env::set_var("OMP_NUM_THREADS", "1");
+        }
+    }
+
     let mut workers = JoinSet::new();
     println!("Starting verification with {available_threads} threads");
 
@@ -88,42 +97,62 @@ pub async fn ingest(
                     .to_string_lossy()
                     .to_string();
 
-                let mut failed_stage: Option<IngestStage> = None;
-                let mut error_msg: Option<String> = None;
+                let mut failure: Option<FailureDetail> = None;
                 let mut computed_hash: Option<String> = None;
                 let mut file_bytes: u64 = 0;
                 let mut extracted_asset: Option<NewDbAsset> = None;
 
-                // Stage 1: Search & Type Check (mirrors suisai search_path_for_assets infer check)
-                if !is_image_by_infer(&path) {
-                    failed_stage = Some(IngestStage::SearchPath);
-                    error_msg = Some(
-                        "File magic bytes not recognized as Image format by infer".to_string(),
-                    );
+                // Step 1: Search & Type Check (run off-thread to avoid blocking Tokio reactor)
+                let path_for_infer = path.clone();
+                let is_image =
+                    tokio::task::spawn_blocking(move || is_image_by_infer(&path_for_infer))
+                        .await
+                        .unwrap_or(false);
+
+                if !is_image {
+                    failure = Some(FailureDetail::file_read(
+                        "File header magic bytes not recognized as valid image format by infer",
+                    ));
                 }
 
-                // Stage 2: Hash & Read (mirrors suisai hash_and_transfer)
-                if failed_stage.is_none() {
+                // Step 2: Hash & Read (mirrors suisai hash_and_transfer streaming)
+                if failure.is_none() {
                     match hash_and_read(&path).await {
                         Ok((h, bytes)) => {
                             computed_hash = Some(h);
                             file_bytes = bytes;
                         }
                         Err(e) => {
-                            failed_stage = Some(IngestStage::HashAndRead);
-                            error_msg = Some(format!("Error reading/streaming file: {e}"));
+                            failure = Some(FailureDetail::file_read(format!(
+                                "Failed reading file from disk: {e}"
+                            )));
                         }
                     }
                 }
 
-                // Stage 3: Metadata Extraction (mirrors suisai SuisaiAsset::to_db_entry)
-                if failed_stage.is_none() {
+                // Step 3 & 4: Metadata Extraction & RAW Sensor Decode in a single blocking task (matching suisai)
+                // This keeps the file hot in OS page cache and eliminates redundant context switching.
+                if failure.is_none() {
                     let path_clone = path.clone();
                     let hash_clone = computed_hash.clone().unwrap_or_default();
                     let size_on_disk = file_bytes.div_ceil(1024) as i64;
+                    let dest_thumb = save_thumbnails.as_ref().map(|dir| {
+                        let stem = path_clone.file_stem().unwrap_or_default().to_string_lossy();
+                        dir.join(format!("{stem}.jpeg"))
+                    });
 
-                    let meta_res = tokio::task::spawn_blocking(move || {
-                        path_clone.try_to_db_entry(hash_clone, size_on_disk)
+                    let (meta_res, thumb_res) = tokio::task::spawn_blocking(move || {
+                        let meta = path_clone.try_to_db_entry(hash_clone, size_on_disk);
+                        let thumb = if meta.is_ok() {
+                            Some(test_extract_thumbnail(
+                                &path_clone,
+                                dest_thumb.as_deref(),
+                                half_size,
+                            ))
+                        } else {
+                            None
+                        };
+                        (meta, thumb)
                     })
                     .await
                     .unwrap();
@@ -131,44 +160,32 @@ pub async fn ingest(
                     match meta_res {
                         Ok(asset) => {
                             extracted_asset = Some(asset);
+                            if let Some(Err(fail)) = thumb_res {
+                                failure = Some(fail);
+                            }
                         }
-                        Err(e) => {
-                            failed_stage = Some(IngestStage::MetadataExtraction);
-                            error_msg = Some(format!("Error extracting EXIF metadata: {e}"));
+                        Err(fail) => {
+                            failure = Some(fail);
                         }
                     }
                 }
 
-                // Stage 4: Thumbnail Extraction & RAW Sensor Decode (mirrors suisai extract_thumbnail)
-                if failed_stage.is_none() {
-                    let path_clone = path.clone();
-                    let dest_thumb = save_thumbnails.as_ref().map(|dir| {
-                        let stem = path_clone.file_stem().unwrap_or_default().to_string_lossy();
-                        dir.join(format!("{stem}.jpeg"))
-                    });
+                // Record outcome into summary lock, releasing immediately before terminal I/O
+                {
+                    let mut s = summary.lock().await;
+                    s.total += 1;
+                    s.total_bytes += file_bytes;
 
-                    let thumb_res = tokio::task::spawn_blocking(move || {
-                        test_extract_thumbnail(&path_clone, dest_thumb.as_deref(), half_size)
-                    })
-                    .await
-                    .unwrap();
-
-                    if let Err(e) = thumb_res {
-                        failed_stage = Some(IngestStage::ThumbnailExtraction);
-                        error_msg =
-                            Some(format!("Error decoding RAW and generating thumbnail: {e}"));
+                    if let Some(ref fail) = failure {
+                        s.failed += 1;
+                        *s.failure_breakdown.entry(fail.category).or_insert(0) += 1;
+                    } else {
+                        s.passed += 1;
                     }
                 }
 
-                // Record outcome
-                let mut s = summary.lock().await;
-                s.total += 1;
-                s.total_bytes += file_bytes;
-
-                if let Some(stage) = failed_stage {
-                    s.failed += 1;
-                    *s.stage_failures.entry(stage).or_insert(0) += 1;
-
+                // Print terminal output outside the summary lock so workers never stall each other
+                if let Some(fail) = failure {
                     eprintln!();
                     eprintln!(
                         "{} {}",
@@ -176,22 +193,18 @@ pub async fn ingest(
                         path.display().to_string().bold()
                     );
                     eprintln!(
-                        "  {} [Stage {}] {} ({})",
-                        "Failed Stage:".red().bold(),
-                        stage.step_number(),
-                        stage.name().yellow().bold(),
-                        stage.description()
+                        "  {} {}",
+                        "Failure Reason:".red().bold(),
+                        fail.category.name().yellow().bold()
                     );
-                    if let Some(err) = error_msg {
-                        eprintln!("  {} {}", "Error:       ".red().bold(), err);
-                    }
+                    eprintln!("  {} {}", "Error:         ".red().bold(), fail.message);
                     if let Some(h) = computed_hash {
-                        eprintln!("  {} {}", "xxh3 Hash:   ".cyan(), h);
+                        eprintln!("  {} {}", "xxh3 Hash:     ".cyan(), h);
                     }
                     if file_bytes > 0 {
                         eprintln!(
                             "  {} {} bytes ({:.2} MB)",
-                            "File Size:   ".cyan(),
+                            "File Size:     ".cyan(),
                             file_bytes,
                             file_bytes as f64 / (1024.0 * 1024.0)
                         );
@@ -212,7 +225,6 @@ pub async fn ingest(
                     }
                     eprintln!();
                 } else {
-                    s.passed += 1;
                     let meta_info = extracted_asset.as_ref().map_or_else(String::new, |a| {
                         format!(
                             " | {} | {}x{} | ISO {}",
@@ -286,16 +298,15 @@ fn print_ingest_summary(summary: &IngestSummary) {
     }
 
     println!("{}", "-".repeat(60).cyan());
-    println!("{}", "Stage Failure Breakdown:".bold());
+    println!("{}", "Failure Breakdown:".bold());
 
-    for stage in &IngestStage::ALL {
-        let count = summary.stage_failures.get(stage).copied().unwrap_or(0);
-        let line = format!(
-            "  [Stage {}] {:<26} : {}",
-            stage.step_number(),
-            stage.name(),
-            count
-        );
+    for category in &FailureCategory::ALL {
+        let count = summary
+            .failure_breakdown
+            .get(category)
+            .copied()
+            .unwrap_or(0);
+        let line = format!("  {:<36} : {}", category.name(), count);
         if count > 0 {
             println!("{}", line.red().bold());
         } else {
