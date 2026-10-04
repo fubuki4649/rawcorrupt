@@ -145,15 +145,9 @@ pub async fn ingest(
 
                     let (meta_res, thumb_res) = tokio::task::spawn_blocking(move || {
                         let meta = path_clone.try_to_db_entry(hash_clone, size_on_disk);
-                        let thumb = if meta.is_ok() {
-                            Some(test_extract_thumbnail(
-                                &path_clone,
-                                dest_thumb.as_deref(),
-                                half_size,
-                            ))
-                        } else {
-                            None
-                        };
+                        let thumb = meta.is_ok().then(|| {
+                            test_extract_thumbnail(&path_clone, dest_thumb.as_deref(), half_size)
+                        });
                         (meta, thumb)
                     })
                     .await
@@ -162,13 +156,9 @@ pub async fn ingest(
                     match meta_res {
                         Ok(asset) => {
                             extracted_asset = Some(asset);
-                            if let Some(Err(fail)) = thumb_res {
-                                failure = Some(fail);
-                            }
+                            failure = thumb_res.and_then(|r| r.err());
                         }
-                        Err(fail) => {
-                            failure = Some(fail);
-                        }
+                        Err(fail) => failure = Some(fail),
                     }
                 }
 
@@ -181,11 +171,8 @@ pub async fn ingest(
                     if let Some(ref fail) = failure {
                         s.failed += 1;
                         *s.failure_breakdown.entry(fail.category).or_insert(0) += 1;
-                        let abs_path = std::fs::canonicalize(&path).unwrap_or_else(|_| {
-                            std::path::absolute(&path).unwrap_or_else(|_| path.clone())
-                        });
                         s.corrupted_files.push(CorruptedFile {
-                            path: abs_path,
+                            path: std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
                             category: fail.category,
                             error: fail.message.clone(),
                         });
@@ -196,42 +183,33 @@ pub async fn ingest(
 
                 // Print terminal output outside the summary lock so workers never stall each other
                 if let Some(fail) = failure {
-                    eprintln!();
                     eprintln!(
-                        "{} {}",
+                        "\n{} {}\n  {} {}\n  {} {}",
                         "[FAIL]".white().on_red().bold(),
-                        path.display().to_string().bold()
-                    );
-                    eprintln!(
-                        "  {} {}",
+                        path.display().to_string().bold(),
                         "Failure Reason:".red().bold(),
-                        fail.category.name().yellow().bold()
+                        fail.category.name().yellow().bold(),
+                        "Error:         ".red().bold(),
+                        fail.message
                     );
-                    eprintln!("  {} {}", "Error:         ".red().bold(), fail.message);
                     if let Some(h) = computed_hash {
-                        eprintln!("  {} {}", "xxh3 Hash:     ".cyan(), h);
+                        eprintln!("  {} {h}", "xxh3 Hash:     ".cyan());
                     }
                     if file_bytes > 0 {
                         eprintln!(
-                            "  {} {} bytes ({:.2} MB)",
+                            "  {} {file_bytes} bytes ({:.2} MB)",
                             "File Size:     ".cyan(),
-                            file_bytes,
                             file_bytes as f64 / (1024.0 * 1024.0)
                         );
                     }
-
-                    if let Some(asset) = extracted_asset {
-                        eprintln!("  {}", "Extracted Metadata Prior to Failure:".cyan().bold());
-                        eprintln!("    Camera Model: {}", asset.camera_model);
-                        eprintln!("    Lens Model:   {}", asset.lens_model);
-                        eprintln!("    Photo Date:   {}", asset.photo_date);
+                    if let Some(a) = extracted_asset {
                         eprintln!(
-                            "    Resolution:   {}x{}",
-                            asset.resolution_width, asset.resolution_height
+                            "  {}\n    Camera Model: {}\n    Lens Model:   {}\n    Photo Date:   {}\n    Resolution:   {}x{}\n    ISO:          {}\n    Shutter:      {}\n    Aperture:     f/{:.1}",
+                            "Extracted Metadata Prior to Failure:".cyan().bold(),
+                            a.camera_model, a.lens_model, a.photo_date,
+                            a.resolution_width, a.resolution_height,
+                            a.iso, a.shutter_speed, a.aperture
                         );
-                        eprintln!("    ISO:          {}", asset.iso);
-                        eprintln!("    Shutter:      {}", asset.shutter_speed);
-                        eprintln!("    Aperture:     f/{:.1}", asset.aperture);
                     }
                     eprintln!();
                 } else {
@@ -266,29 +244,23 @@ pub async fn ingest(
     if let Some(ref log_path) = log_file
         && !final_summary.corrupted_files.is_empty()
     {
-        let mut log_content = String::new();
-        for item in &final_summary.corrupted_files {
-            log_content.push_str(&item.path.display().to_string());
-            log_content.push('\n');
-        }
-        match tokio::fs::write(log_path, log_content).await {
-            Ok(()) => {
-                println!(
-                    "{} Exported {} corrupted file path(s) to {}",
-                    "✓".green().bold(),
-                    final_summary.corrupted_files.len().to_string().bold(),
-                    log_path.display().to_string().yellow().bold()
-                );
-                println!();
-            }
-            Err(e) => {
-                eprintln!(
-                    "{} Failed to write corrupted log to {}: {e}",
-                    "Warning:".yellow().bold(),
-                    log_path.display()
-                );
-                eprintln!();
-            }
+        let content: String = final_summary
+            .corrupted_files
+            .iter()
+            .map(|item| format!("{}\n", item.path.display()))
+            .collect();
+        match tokio::fs::write(log_path, content).await {
+            Ok(()) => println!(
+                "{} Exported {} corrupted file path(s) to {}\n",
+                "✓".green().bold(),
+                final_summary.corrupted_files.len().to_string().bold(),
+                log_path.display().to_string().yellow().bold()
+            ),
+            Err(e) => eprintln!(
+                "{} Failed to write corrupted log to {}: {e}\n",
+                "Warning:".yellow().bold(),
+                log_path.display()
+            ),
         }
     }
 
@@ -296,13 +268,11 @@ pub async fn ingest(
 }
 
 fn print_ingest_summary(summary: &IngestSummary) {
-    println!("{}", "=".repeat(60).cyan());
+    let div = "=".repeat(60).cyan();
     println!(
-        "{}",
+        "{div}\n{}\n{div}",
         "            CAMERA RAW VERIFICATION SUMMARY            ".bold()
     );
-    println!("{}", "=".repeat(60).cyan());
-
     println!(
         "Total Files Scanned:   {}",
         summary.total.to_string().bold()
@@ -311,16 +281,14 @@ fn print_ingest_summary(summary: &IngestSummary) {
         "Total Passed (Valid):  {}",
         summary.passed.to_string().green().bold()
     );
-
-    if summary.failed > 0 {
-        println!(
-            "Total Failed (Corrupt): {}",
+    println!(
+        "Total Failed (Corrupt): {}",
+        if summary.failed > 0 {
             summary.failed.to_string().red().bold()
-        );
-    } else {
-        println!("Total Failed (Corrupt): 0");
-    }
-
+        } else {
+            "0".normal()
+        }
+    );
     println!(
         "Total Data Processed:  {:.2} MB",
         summary.total_bytes as f64 / (1024.0 * 1024.0)
@@ -331,33 +299,32 @@ fn print_ingest_summary(summary: &IngestSummary) {
     );
 
     if summary.duration_ms > 0 {
-        let files_per_sec = (summary.total as f64) / (summary.duration_ms as f64 / 1000.0);
-        let mb_per_sec = (summary.total_bytes as f64 / (1024.0 * 1024.0))
-            / (summary.duration_ms as f64 / 1000.0);
+        let sec = summary.duration_ms as f64 / 1000.0;
         println!(
             "Throughput:            {:.1} files/s ({:.2} MB/s)",
-            files_per_sec, mb_per_sec
+            summary.total as f64 / sec,
+            (summary.total_bytes as f64 / (1024.0 * 1024.0)) / sec
         );
     }
 
-    println!("{}", "-".repeat(60).cyan());
-    println!("{}", "Failure Breakdown:".bold());
-
+    println!("{}\n{}", "-".repeat(60).cyan(), "Failure Breakdown:".bold());
     for category in &FailureCategory::ALL {
         let count = summary
             .failure_breakdown
             .get(category)
             .copied()
             .unwrap_or(0);
-        let line = format!("  {:<36} : {}", category.name(), count);
-        if count > 0 {
-            println!("{}", line.red().bold());
-        } else {
-            println!("{}", line.dimmed());
-        }
+        let line = format!("  {:<36} : {count}", category.name());
+        println!(
+            "{}",
+            if count > 0 {
+                line.red().bold()
+            } else {
+                line.dimmed()
+            }
+        );
     }
-
-    println!("{}", "=".repeat(60).cyan());
+    println!("{div}");
 
     if summary.failed == 0 {
         println!(

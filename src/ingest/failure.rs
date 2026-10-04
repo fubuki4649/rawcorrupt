@@ -28,27 +28,25 @@ impl FailureCategory {
 
     pub const fn name(&self) -> &'static str {
         match self {
-            FailureCategory::FileRead => "File Read / I/O Problem",
-            FailureCategory::Metadata => "Metadata / Header Problem",
-            FailureCategory::EmbeddedThumbnail => "Embedded Thumbnail Problem",
-            FailureCategory::RawSensorData => "RAW Sensor Data Corruption",
-            FailureCategory::JpegEncode => "JPEG Encoding Problem",
+            Self::FileRead => "File Read / I/O Problem",
+            Self::Metadata => "Metadata / Header Problem",
+            Self::EmbeddedThumbnail => "Embedded Thumbnail Problem",
+            Self::RawSensorData => "RAW Sensor Data Corruption",
+            Self::JpegEncode => "JPEG Encoding Problem",
         }
     }
 
     pub const fn description(&self) -> &'static str {
         match self {
-            FailureCategory::FileRead => {
+            Self::FileRead => {
                 "Failed reading file from disk, empty file, or invalid image magic bytes"
             }
-            FailureCategory::Metadata => {
-                "Corrupted EXIF/TIFF headers, broken IFD tags, or invalid dimensions"
-            }
-            FailureCategory::EmbeddedThumbnail => "Corrupted embedded preview or thumbnail stream",
-            FailureCategory::RawSensorData => {
+            Self::Metadata => "Corrupted EXIF/TIFF headers, broken IFD tags, or invalid dimensions",
+            Self::EmbeddedThumbnail => "Corrupted embedded preview or thumbnail stream",
+            Self::RawSensorData => {
                 "Corrupted RAW Bayer data, unexpected EOF in sensor stream, or unpack/demosaic failure"
             }
-            FailureCategory::JpegEncode => "Failed to compress decoded bitmap into JPEG",
+            Self::JpegEncode => "Failed to compress decoded bitmap into JPEG",
         }
     }
 }
@@ -74,24 +72,20 @@ impl FailureDetail {
         }
     }
 
-    pub fn file_read(message: impl Into<String>) -> Self {
-        Self::new(FailureCategory::FileRead, message)
+    pub fn file_read(msg: impl Into<String>) -> Self {
+        Self::new(FailureCategory::FileRead, msg)
     }
-
-    pub fn metadata(message: impl Into<String>) -> Self {
-        Self::new(FailureCategory::Metadata, message)
+    pub fn metadata(msg: impl Into<String>) -> Self {
+        Self::new(FailureCategory::Metadata, msg)
     }
-
-    pub fn embedded_thumbnail(message: impl Into<String>) -> Self {
-        Self::new(FailureCategory::EmbeddedThumbnail, message)
+    pub fn embedded_thumbnail(msg: impl Into<String>) -> Self {
+        Self::new(FailureCategory::EmbeddedThumbnail, msg)
     }
-
-    pub fn raw_sensor_data(message: impl Into<String>) -> Self {
-        Self::new(FailureCategory::RawSensorData, message)
+    pub fn raw_sensor_data(msg: impl Into<String>) -> Self {
+        Self::new(FailureCategory::RawSensorData, msg)
     }
-
-    pub fn jpeg_encode(message: impl Into<String>) -> Self {
-        Self::new(FailureCategory::JpegEncode, message)
+    pub fn jpeg_encode(msg: impl Into<String>) -> Self {
+        Self::new(FailureCategory::JpegEncode, msg)
     }
 }
 

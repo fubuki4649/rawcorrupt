@@ -200,53 +200,53 @@ impl SuisaiAsset for PathBuf {
             Err(e) => {
                 let err_str = e.to_string();
                 let lower = err_str.to_lowercase();
-                if lower.contains("no such file") || lower.contains("permission denied") {
-                    return Err(FailureDetail::file_read(format!(
-                        "Cannot read file for metadata extraction: {err_str}"
-                    )));
-                } else {
-                    return Err(FailureDetail::metadata(format!(
-                        "ExifTool execution failed: {err_str}"
-                    )));
-                }
+                return Err(
+                    if lower.contains("no such file") || lower.contains("permission denied") {
+                        FailureDetail::file_read(format!(
+                            "Cannot read file for metadata extraction: {err_str}"
+                        ))
+                    } else {
+                        FailureDetail::metadata(format!("ExifTool execution failed: {err_str}"))
+                    },
+                );
             }
         };
 
+        let is_thumb = |s: &str| {
+            let l = s.to_lowercase();
+            l.contains("previewimage") || l.contains("thumbnailimage") || l.contains("jpgfromraw")
+        };
+
         if let Some(err) = info.get("Error") {
-            let err_lower = err.to_lowercase();
-            if err_lower.contains("previewimage")
-                || err_lower.contains("thumbnailimage")
-                || err_lower.contains("jpgfromraw")
-            {
-                return Err(FailureDetail::embedded_thumbnail(format!(
+            return Err(if is_thumb(err) {
+                FailureDetail::embedded_thumbnail(format!(
                     "ExifTool reported corrupted embedded preview/thumbnail: {err}"
-                )));
+                ))
             } else {
-                return Err(FailureDetail::metadata(format!(
-                    "ExifTool reported corrupted metadata: {err}"
-                )));
-            }
+                FailureDetail::metadata(format!("ExifTool reported corrupted metadata: {err}"))
+            });
         }
 
-        if let Some(warning) = info.get("Warning") {
-            let warn_lower = warning.to_lowercase();
-            if warn_lower.contains("previewimage")
-                || warn_lower.contains("thumbnailimage")
-                || warn_lower.contains("jpgfromraw")
-            {
+        if let Some(warn) = info.get("Warning") {
+            let l = warn.to_lowercase();
+            if is_thumb(warn) {
                 return Err(FailureDetail::embedded_thumbnail(format!(
-                    "ExifTool reported corrupted embedded preview/thumbnail: {warning}"
+                    "ExifTool reported corrupted embedded preview/thumbnail: {warn}"
                 )));
-            } else if warn_lower.contains("past end of file")
-                || warn_lower.contains("corrupt")
-                || warn_lower.contains("truncated")
-                || warn_lower.contains("bad subifd")
-                || warn_lower.contains("bad ifd")
-                || warn_lower.contains("premature end of file")
-                || warn_lower.contains("error reading")
+            } else if [
+                "past end of file",
+                "corrupt",
+                "truncated",
+                "bad subifd",
+                "bad ifd",
+                "premature end of file",
+                "error reading",
+            ]
+            .iter()
+            .any(|k| l.contains(k))
             {
                 return Err(FailureDetail::metadata(format!(
-                    "ExifTool detected corrupted file structure: {warning}"
+                    "ExifTool detected corrupted file structure: {warn}"
                 )));
             }
         }
@@ -254,49 +254,33 @@ impl SuisaiAsset for PathBuf {
         // Validate that sensor data strips or tiles do not extend beyond the actual file length
         let file_size_bytes = fs::metadata(self).map(|m| m.len()).unwrap_or(0);
         if file_size_bytes > 0 {
-            if let (Some(offsets_str), Some(counts_str)) =
-                (info.get("StripOffsets"), info.get("StripByteCounts"))
-            {
-                let last_offset = offsets_str
-                    .split_whitespace()
-                    .last()
-                    .and_then(|s| s.parse::<u64>().ok());
-                let last_count = counts_str
-                    .split_whitespace()
-                    .last()
-                    .and_then(|s| s.parse::<u64>().ok());
-                if let (Some(offset), Some(count)) = (last_offset, last_count)
-                    && offset.saturating_add(count) > file_size_bytes
+            let check_bounds = |offsets_key: &str,
+                                counts_key: &str,
+                                kind: &str|
+             -> Result<(), FailureDetail> {
+                if let (Some(offsets), Some(counts)) = (info.get(offsets_key), info.get(counts_key))
                 {
-                    return Err(FailureDetail::raw_sensor_data(format!(
-                        "File truncated: sensor data strip ends at byte {} but file is only {} bytes",
-                        offset + count,
-                        file_size_bytes
-                    )));
+                    let last_offset = offsets
+                        .split_whitespace()
+                        .last()
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let last_count = counts
+                        .split_whitespace()
+                        .last()
+                        .and_then(|s| s.parse::<u64>().ok());
+                    if let (Some(o), Some(c)) = (last_offset, last_count)
+                        && o.saturating_add(c) > file_size_bytes
+                    {
+                        return Err(FailureDetail::raw_sensor_data(format!(
+                            "File truncated: sensor data {kind} ends at byte {} but file is only {file_size_bytes} bytes",
+                            o + c
+                        )));
+                    }
                 }
-            }
-
-            if let (Some(offsets_str), Some(counts_str)) =
-                (info.get("TileOffsets"), info.get("TileByteCounts"))
-            {
-                let last_offset = offsets_str
-                    .split_whitespace()
-                    .last()
-                    .and_then(|s| s.parse::<u64>().ok());
-                let last_count = counts_str
-                    .split_whitespace()
-                    .last()
-                    .and_then(|s| s.parse::<u64>().ok());
-                if let (Some(offset), Some(count)) = (last_offset, last_count)
-                    && offset.saturating_add(count) > file_size_bytes
-                {
-                    return Err(FailureDetail::raw_sensor_data(format!(
-                        "File truncated: sensor data tile ends at byte {} but file is only {} bytes",
-                        offset + count,
-                        file_size_bytes
-                    )));
-                }
-            }
+                Ok(())
+            };
+            check_bounds("StripOffsets", "StripByteCounts", "strip")?;
+            check_bounds("TileOffsets", "TileByteCounts", "tile")?;
         }
 
         let res = self.get_resolution(&info);
