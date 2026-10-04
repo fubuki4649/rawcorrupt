@@ -285,18 +285,33 @@ pub async fn ingest(
                             a.camera_model, a.resolution_width, a.resolution_height, a.iso
                         )
                     });
-                    println!(
-                        "{} {} ({:.2} MB){}",
-                        "[PASS]".green().bold(),
-                        filename,
-                        file_bytes as f64 / (1024.0 * 1024.0),
-                        meta_info
-                    );
-                    if (is_single_file || diagnostics)
-                        && let Some(ref diag) = libraw_diag
-                    {
-                        println!("  {} {}", "LibRaw Route:  ".cyan(), diag.open_route);
-                        println!("  {} {}", "Return Codes:  ".cyan(), diag.status_summary());
+                    if is_single_file || diagnostics {
+                        println!(
+                            "{} {} ({:.2} MB){}",
+                            "[PASS]".green().bold(),
+                            filename,
+                            file_bytes as f64 / (1024.0 * 1024.0),
+                            meta_info
+                        );
+                        if let Some(ref h) = computed_hash {
+                            println!("  {} {h}", "xxh3 Hash:     ".cyan());
+                        }
+                        if let Some(ref diag) = libraw_diag {
+                            println!("  {} {}", "LibRaw Route:  ".cyan(), diag.open_route);
+                            println!("  {} {}", "Return Codes:  ".cyan(), diag.status_summary());
+                        }
+                    } else {
+                        let hash_info = computed_hash.as_ref().map_or_else(String::new, |h| {
+                            format!(" | xxh3: {h}")
+                        });
+                        println!(
+                            "{} {} ({:.2} MB){}{}",
+                            "[PASS]".green().bold(),
+                            filename,
+                            file_bytes as f64 / (1024.0 * 1024.0),
+                            hash_info.cyan(),
+                            meta_info
+                        );
                     }
                 }
             }
