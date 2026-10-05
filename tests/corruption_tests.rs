@@ -117,7 +117,9 @@ async fn test_non_raw_image_fails_at_thumbnail_extraction() {
     assert_eq!(summary.total, 1);
     assert_eq!(summary.failed, 1);
     assert_eq!(
-        summary.failure_breakdown.get(&FailureCategory::Metadata),
+        summary
+            .failure_breakdown
+            .get(&FailureCategory::RawSensorData),
         Some(&1)
     );
 }
@@ -212,7 +214,7 @@ async fn test_helpers_hash_and_thumbnail() {
     assert!(thumb_dest.exists());
 
     // Test in-memory thumbnail decode
-    test_extract_thumbnail(&sample_raw, None, true).unwrap();
+    test_extract_thumbnail(&sample_raw, None).unwrap();
 }
 
 #[tokio::test]
@@ -308,7 +310,7 @@ async fn test_corrupted_files_exported_to_log() {
 }
 
 #[test]
-fn test_libraw_data_error_callback_catches_corruption() {
+fn test_rawler_catches_sensor_corruption() {
     let sample_dng = PathBuf::from(
         "/home/kaneki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/czkawka_core-12.0.2/src/common/test_assets/test_raw.dng",
     );
@@ -322,67 +324,40 @@ fn test_libraw_data_error_callback_catches_corruption() {
     let dng_bytes = fs::read(&sample_dng).unwrap();
     fs::write(&trunc_dng, &dng_bytes[..dng_bytes.len() - 500]).unwrap();
 
-    // Directly test Stage 4 decode: must return Err with LibRaw corruption details
-    let res = test_extract_thumbnail(&trunc_dng, None, false);
+    // Directly test Stage 4 decode: must return Err with corruption details
+    let res = test_extract_thumbnail(&trunc_dng, None);
     assert!(
         res.is_err(),
-        "Expected error from LibRaw on corrupted sensor stream"
+        "Expected error from rawler on corrupted sensor stream"
     );
     let err = res.unwrap_err();
     let err_msg = err.to_string();
     assert!(
-        err_msg.contains("LibRaw")
-            || err_msg.contains("unexpected end of file")
-            || err_msg.contains("corruption"),
-        "Error message did not contain expected LibRaw details: {err_msg}"
+        err_msg.contains("Failed to decode RAW")
+            || err_msg.contains("Failed to develop RAW")
+            || err_msg.contains("RAW Sensor Data Corruption"),
+        "Error message did not contain expected rawler details: {err_msg}"
     );
-    assert!(
-        err.diagnostics.is_some(),
-        "Expected diagnostics to be attached to FailureDetail"
-    );
-    let diag = err.diagnostics.unwrap();
-    assert_eq!(diag.open_status, 0);
-    assert!(diag.open_route.contains("libraw_open_file"));
 }
 
 #[test]
-fn test_libraw_version_and_dcraw_emu_comparison() {
-    let tool_ver = rawcorrupt::libraw_version_string();
-    assert!(
-        !tool_ver.is_empty(),
-        "libraw_version_string must not be empty"
-    );
-    assert!(tool_ver.starts_with("0.") || tool_ver.starts_with("1."));
-
-    let dcraw_ver = rawcorrupt::detect_dcraw_emu_version();
-    if std::path::Path::new("/usr/bin/dcraw_emu").exists() {
-        assert!(
-            dcraw_ver.is_some(),
-            "Expected dcraw_emu version to be detected"
-        );
-        let sys_ver = dcraw_ver.unwrap();
-        println!("Tool LibRaw: {tool_ver}, System dcraw_emu: {sys_ver}");
-        assert!(sys_ver.contains("0.22.2"));
-    }
+fn test_rawler_version_reported() {
+    let tool_ver = rawcorrupt::rawler_version_string();
+    assert_eq!(tool_ver, "0.8.0");
 }
 
 #[test]
-fn test_libraw_diagnostics_logged_on_decode() {
+fn test_decoder_diagnostics_logged_on_decode() {
     let sample_raw = PathBuf::from("/home/kaneki/suisai-test/original_raws/_DSC0326.ARW");
     if !sample_raw.exists() {
         eprintln!("Skipping test: test raw not found");
         return;
     }
 
-    let diag = test_extract_thumbnail(&sample_raw, None, true).expect("Valid raw should decode");
-    assert_eq!(diag.open_status, 0);
-    assert_eq!(diag.unpack_status, Some(0));
-    assert_eq!(diag.process_status, Some(0));
-    assert!(diag.open_route.contains("libraw_open_file"));
-    assert!(diag.status_summary().contains("open=0 (LIBRAW_SUCCESS)"));
-    assert!(diag.status_summary().contains("unpack=0 (LIBRAW_SUCCESS)"));
-    assert!(
-        diag.status_summary()
-            .contains("dcraw_process=0 (LIBRAW_SUCCESS)")
-    );
+    let diag = test_extract_thumbnail(&sample_raw, None).expect("Valid raw should decode");
+    assert!(diag.engine.contains("rawler"));
+    assert!(diag.raw_dimensions.0 > 0 && diag.raw_dimensions.1 > 0);
+    assert!(diag.output_dimensions.0 > 0 && diag.output_dimensions.1 > 0);
+    assert_eq!(diag.color_mode, "ThreeColor");
+    assert!(diag.status_summary().contains("rawler 0.8.0"));
 }

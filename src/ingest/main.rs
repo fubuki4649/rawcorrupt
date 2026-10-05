@@ -1,6 +1,6 @@
 use crate::ingest::failure::{CorruptedFile, FailureCategory, FailureDetail};
 use crate::ingest::helpers::extract_thumbnail::{
-    detect_dcraw_emu_version, libraw_version_string, test_extract_thumbnail,
+    JPEG_QUALITY, rawler_version_string, test_extract_thumbnail,
 };
 use crate::ingest::helpers::hash_and_transfer::hash_and_read;
 use crate::ingest::helpers::search_path::{is_image_by_infer, search_path_for_assets};
@@ -32,7 +32,7 @@ pub struct IngestSummary {
 pub async fn ingest(
     path: String,
     threads: Option<usize>,
-    half_size: bool,
+    _half_size: bool,
     save_thumbnails: Option<PathBuf>,
     log_file: Option<PathBuf>,
     diagnostics: bool,
@@ -41,44 +41,25 @@ pub async fn ingest(
     let start_time = Instant::now();
     let is_single_file = target.is_file();
 
-    let tool_version = libraw_version_string();
-    let dcraw_version = detect_dcraw_emu_version();
+    let tool_version = rawler_version_string();
 
     println!("{}", "=".repeat(60).cyan());
     println!(
         "{}",
-        "               LIBRAW ENVIRONMENT & DIAGNOSTICS               ".bold()
+        "               RAW DECODER ENVIRONMENT & INFO               ".bold()
     );
     println!("{}", "=".repeat(60).cyan());
-    println!("  Tool LibRaw Version:     {}", tool_version.green().bold());
-    match dcraw_version {
-        Some(ref sys_ver) => {
-            if tool_version.starts_with(sys_ver) || sys_ver.starts_with(&tool_version) {
-                println!(
-                    "  System dcraw_emu:        {} {}",
-                    sys_ver.green().bold(),
-                    format!("(matches tool: {tool_version})").dimmed()
-                );
-            } else {
-                println!(
-                    "  System dcraw_emu:        {} {}",
-                    sys_ver.yellow().bold(),
-                    format!("(VERSION MISMATCH vs tool: {tool_version})")
-                        .red()
-                        .bold()
-                );
-            }
-        }
-        None => {
-            println!(
-                "  System dcraw_emu:        {}",
-                "not found in PATH".yellow()
-            );
-        }
-    }
     println!(
-        "  Path Input Mode:         {}",
-        "libraw_open_file (direct file path, no buffer/stream)".cyan()
+        "  Decoder Engine:          {}",
+        format!("rawler {tool_version}").green().bold()
+    );
+    println!(
+        "  Color Pipeline:          {}",
+        "RawDevelop intermediate RGB pipeline".cyan()
+    );
+    println!(
+        "  JPEG Preset:             {}",
+        format!("Preset::ProgressiveSmallest (q={JPEG_QUALITY})").cyan()
     );
     println!("{}", "=".repeat(60).cyan());
     println!();
@@ -110,15 +91,6 @@ pub async fn ingest(
             .get()
     });
 
-    // When running parallel workers across multiple files, limit OpenMP per-file
-    // internal demosaicing threads to 1 to prevent severe CPU oversubscription.
-    if std::env::var_os("OMP_NUM_THREADS").is_none() && available_threads > 1 {
-        // SAFETY: Set before any LibRaw processing begins.
-        unsafe {
-            std::env::set_var("OMP_NUM_THREADS", "1");
-        }
-    }
-
     let mut workers = JoinSet::new();
     println!("Starting verification with {available_threads} threads");
 
@@ -149,7 +121,7 @@ pub async fn ingest(
                 let mut computed_hash: Option<String> = None;
                 let mut file_bytes: u64 = 0;
                 let mut extracted_asset: Option<NewDbAsset> = None;
-                let mut libraw_diag = None;
+                let mut decoder_diag = None;
 
                 // Step 1: Search & Type Check (run off-thread to avoid blocking Tokio reactor)
                 let path_for_infer = path.clone();
@@ -193,7 +165,7 @@ pub async fn ingest(
                     let (meta_res, thumb_res) = tokio::task::spawn_blocking(move || {
                         let meta = path_clone.try_to_db_entry(hash_clone, size_on_disk);
                         let thumb = meta.is_ok().then(|| {
-                            test_extract_thumbnail(&path_clone, dest_thumb.as_deref(), half_size)
+                            test_extract_thumbnail(&path_clone, dest_thumb.as_deref())
                         });
                         (meta, thumb)
                     })
@@ -204,9 +176,9 @@ pub async fn ingest(
                         Ok(asset) => {
                             extracted_asset = Some(asset);
                             match thumb_res {
-                                Some(Ok(diag)) => libraw_diag = Some(diag),
+                                Some(Ok(diag)) => decoder_diag = Some(diag),
                                 Some(Err(fail)) => {
-                                    libraw_diag = fail.diagnostics.clone();
+                                    decoder_diag = fail.diagnostics.clone();
                                     failure = Some(fail);
                                 }
                                 None => {}
@@ -248,15 +220,12 @@ pub async fn ingest(
                         fail.message
                     );
                     if let Some(ref diag) = fail.diagnostics {
-                        eprintln!("  {} {}", "LibRaw Route:  ".cyan().bold(), diag.open_route);
+                        eprintln!("  {} {}", "Decoder Engine:".cyan().bold(), diag.engine);
                         eprintln!(
                             "  {} {}",
-                            "Return Codes:  ".cyan().bold(),
+                            "Decoder Status: ".cyan().bold(),
                             diag.status_summary()
                         );
-                        if let Some(ref cb) = diag.data_callback {
-                            eprintln!("  {} {}", "Data Callback: ".yellow().bold(), cb);
-                        }
                     }
                     if let Some(h) = computed_hash {
                         eprintln!("  {} {h}", "xxh3 Hash:     ".cyan());
@@ -294,11 +263,11 @@ pub async fn ingest(
                             meta_info
                         );
                         if let Some(ref h) = computed_hash {
-                            println!("  {} {h}", "xxh3 Hash:     ".cyan());
+                            println!("  {} {h}", "xxh3 Hash:      ".cyan());
                         }
-                        if let Some(ref diag) = libraw_diag {
-                            println!("  {} {}", "LibRaw Route:  ".cyan(), diag.open_route);
-                            println!("  {} {}", "Return Codes:  ".cyan(), diag.status_summary());
+                        if let Some(ref diag) = decoder_diag {
+                            println!("  {} {}", "Decoder Engine: ".cyan(), diag.engine);
+                            println!("  {} {}", "Decoder Status: ".cyan(), diag.status_summary());
                         }
                     } else {
                         let hash_info = computed_hash.as_ref().map_or_else(String::new, |h| {
